@@ -1,1 +1,13 @@
+# Python 3.11 recommended
 
+DateTime==5.5
+cdifflib==1.2.9
+PyQt6==6.7.1
+
+torch==2.5.1
+torchaudio==2.5.1
+
+demucs==4.0.1
+whisperx==3.2.0
+
+soundfile==0.13.1
