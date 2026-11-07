@@ -1,7 +1,6 @@
 
 # Python 3.11 recommended
 
-db-sqlite3==0.0.1
 DateTime==5.5
 cdifflib==1.2.9
 PyQt6==6.7.1

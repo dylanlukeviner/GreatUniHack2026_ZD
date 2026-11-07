@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QTextBrowser, QProgressBar, QComboBox, QLabel)
+                             QPushButton, QTextBrowser, QProgressBar)
 from PyQt6.QtCore import Qt
 from audio_handler import AudioRecorder
 from ai_engine import AITutorWorker
@@ -15,8 +15,7 @@ class TutorApp(QMainWindow):
         self.chat_history = [] 
 
         self.setup_ui()
-        self.populate_mic_dropdown()
-        self.add_system_message("Welcome! Please select your microphone from the dropdown above, then hold the button to speak.")
+        self.add_system_message("Welcome! Hold the button to speak.")
 
     def setup_ui(self):
         central_widget = QWidget()
@@ -24,14 +23,6 @@ class TutorApp(QMainWindow):
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
-
-        # --- NEW: Microphone Selector ---
-        mic_layout = QHBoxLayout()
-        mic_layout.addWidget(QLabel("<b>Microphone:</b>"))
-        self.mic_dropdown = QComboBox()
-        self.mic_dropdown.setStyleSheet("padding: 5px; font-size: 14px;")
-        mic_layout.addWidget(self.mic_dropdown, stretch=1)
-        layout.addLayout(mic_layout)
 
         # Chat Display
         self.chat_display = QTextBrowser()
@@ -57,7 +48,7 @@ class TutorApp(QMainWindow):
         # Controls Layout
         controls_layout = QHBoxLayout()
 
-        self.btn_record = QPushButton("🎤 Hold to Speak")
+        self.btn_record = QPushButton("Hold to Speak")
         self.btn_record.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_record.setStyleSheet("""
             QPushButton {
@@ -72,7 +63,7 @@ class TutorApp(QMainWindow):
         self.btn_record.released.connect(self.stop_recording)
         controls_layout.addWidget(self.btn_record, stretch=3)
 
-        self.btn_play = QPushButton("🔊 Play Audio")
+        self.btn_play = QPushButton("Play Audio")
         self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_play.setStyleSheet("""
             QPushButton {
@@ -89,26 +80,16 @@ class TutorApp(QMainWindow):
 
         layout.addLayout(controls_layout)
 
-    def populate_mic_dropdown(self):
-        """Fills the dropdown with available microphones."""
-        devices = self.recorder.get_input_devices()
-        for dev in devices:
-            # Add item with the device name, and store the device index as hidden data
-            self.mic_dropdown.addItem(dev["name"], dev["index"])
-            if dev["is_default"]:
-                self.mic_dropdown.setCurrentIndex(self.mic_dropdown.count() - 1)
-
     def start_recording(self):
-        self.btn_record.setText("🔴 Listening... (Release to Send)")
+        self.btn_record.setText("Listening... (Release to Send)")
         self.btn_record.setStyleSheet(self.btn_record.styleSheet().replace("#2b78e4", "#e74c3c"))
         self.btn_play.setEnabled(False)
         
-        # Get the selected microphone index from the dropdown
-        selected_mic_index = self.mic_dropdown.currentData()
-        self.recorder.start_recording(device_index=selected_mic_index)
+        # Starts recording using the default microphone
+        self.recorder.start_recording()
 
     def stop_recording(self):
-        self.btn_record.setText("🎤 Hold to Speak")
+        self.btn_record.setText("Hold to Speak")
         self.btn_record.setStyleSheet(self.btn_record.styleSheet().replace("#e74c3c", "#2b78e4"))
         
         audio_path = self.recorder.stop_recording()
@@ -147,12 +128,12 @@ class TutorApp(QMainWindow):
         html = f"""
         <div style='margin-bottom: 20px; text-align: left;'>
             <div style='display: inline-block; background-color: #ffffff; color: #333; padding: 15px; border-radius: 18px; border: 1px solid #e0e0e0; max-width: 85%; box-shadow: 0px 2px 4px rgba(0,0,0,0.05);'>
-                <b style='color: #2b78e4;'>🤖 Tutor</b><br><br>
+                <b style='color: #2b78e4;'>Tutor</b><br><br>
                 <span style='font-size: 15px;'>{response}</span>
                 <hr style='border: 0; border-top: 1px solid #eee; margin: 12px 0;'>
                 <div style='background-color: #fff9e6; padding: 10px; border-radius: 8px; font-size: 13px; color: #665c3d;'>
-                    <b>📝 Feedback:</b> {correction}<br><br>
-                    <b>🗣️ Pronunciation:</b> <i>{pronunciation}</i>
+                    <b>Feedback:</b> {correction}<br><br>
+                    <b>Pronunciation:</b> <i>{pronunciation}</i>
                 </div>
             </div>
         </div>

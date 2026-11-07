@@ -3,7 +3,8 @@ import time
 import os
 import random
 
-USE_REAL_WHISPER = False 
+# Enabled real Whisper processing
+USE_REAL_WHISPER = True 
 
 if USE_REAL_WHISPER:
     import whisperx
