@@ -18,7 +18,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QTextBrowser,
-    QProgressBar, QComboBox, QLabel, QFileDialog
+    QProgressBar, QComboBox, QLabel, QFileDialog, QGridLayout, QLineEdit
 )
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -72,6 +72,9 @@ LLM_MODEL_PATH = os.environ.get(
 # noticeably more accurate for Russian and other non-English languages.
 WHISPER_MODEL_SIZE = "small"
 
+# CEFR level the tutor should speak at
+LEARNER_LEVEL = "A1-A2"
+
 LLM_CONTEXT_SIZE = 4096
 LLM_MAX_NEW_TOKENS = 500
 LLM_TEMPERATURE = 0.4
@@ -112,6 +115,70 @@ LANGUAGES = {
 LANGUAGE_NAMES = {
     code: name for name, code in LANGUAGES.items()
 }
+
+
+# =========================================================
+# PRACTICE SCENARIOS (A1-A2)
+# Each entry: (title shown in the dropdown, role the tutor plays)
+# =========================================================
+
+SCENARIOS = [
+    ("Greeting someone for the first time", "a friendly person the student is meeting for the first time"),
+    ("Introducing yourself", "a new classmate who wants to know the student's name, age and country"),
+    ("Talking about your family", "a friend who asks about the student's family"),
+    ("Talking about your job or studies", "a new colleague who asks about the student's work or studies"),
+    ("Describing your daily routine", "a friend who asks what the student does every day"),
+    ("Ordering food in a restaurant", "a waiter taking the student's order"),
+    ("Ordering coffee at a cafe", "a barista taking the student's order"),
+    ("Buying food at a market", "a market seller with fruit and vegetables"),
+    ("Shopping for clothes", "a shop assistant in a clothes shop"),
+    ("Asking for prices", "a shopkeeper who answers questions about prices"),
+    ("At the supermarket", "a supermarket worker who helps the student find things"),
+    ("Paying at the checkout", "a cashier at a shop checkout"),
+    ("Asking for directions", "a friendly passer-by who gives simple directions"),
+    ("Taking a taxi", "a taxi driver asking where the student wants to go"),
+    ("Buying a bus or train ticket", "a ticket seller at a station"),
+    ("Airport check-in", "an airline check-in agent"),
+    ("Passport control", "a border officer asking simple questions"),
+    ("Checking in to a hotel", "a hotel receptionist"),
+    ("Reporting a problem in a hotel room", "a hotel receptionist who helps with a problem"),
+    ("Booking a table by phone", "a restaurant host answering the phone"),
+    ("Making a doctor's appointment", "a clinic receptionist"),
+    ("At the doctor's", "a doctor asking about simple symptoms"),
+    ("At the pharmacy", "a pharmacist who helps with a small health problem"),
+    ("At the bank", "a bank clerk helping to change money"),
+    ("At the post office", "a post office clerk helping to send a letter or parcel"),
+    ("Renting an apartment", "a landlord showing a small apartment"),
+    ("Talking to a neighbour", "a friendly neighbour"),
+    ("Phoning a friend to meet up", "a friend on the phone arranging to meet"),
+    ("Inviting a friend to a party", "a friend who is invited to a party"),
+    ("Talking about the weather", "a friend chatting about the weather"),
+    ("Talking about hobbies", "a new friend who asks about hobbies"),
+    ("Talking about favourite food", "a friend who loves talking about food"),
+    ("Talking about music and films", "a friend who asks about favourite music and films"),
+    ("Planning a holiday", "a friend helping to plan a holiday"),
+    ("Describing your home", "a friend who asks about the student's home"),
+    ("Talking about your city", "a visitor who asks about the student's city"),
+    ("At the cinema", "a cinema ticket seller"),
+    ("At the gym or sports club", "a gym receptionist"),
+    ("Joining a language class", "a school receptionist signing the student up"),
+    ("In the classroom", "a teacher asking simple classroom questions"),
+    ("A simple job interview", "an interviewer asking easy questions"),
+    ("Lost property", "a staff member at a lost property office"),
+    ("Lost in the city", "a police officer helping a lost visitor"),
+    ("Making plans and telling the time", "a friend making plans for the weekend"),
+    ("At a birthday party", "the host of a birthday party"),
+    ("Ordering takeaway by phone", "a staff member at a takeaway restaurant"),
+    ("Buying a SIM card or phone", "a phone shop assistant"),
+    ("At the hairdresser", "a hairdresser asking how to cut the student's hair"),
+    ("Train delay at the station", "a station information officer"),
+    ("Thanking a host and saying goodbye", "a host saying goodbye after the student's visit"),
+]
+
+assert len(SCENARIOS) == 50
+
+FREE_CONVERSATION = "Free conversation (no scenario)"
+CUSTOM_SCENARIO = "Custom situation..."
 
 
 # =========================================================
@@ -493,7 +560,8 @@ class AITutorWorker(QThread):
         language,
         whisper_model,
         llm=None,
-        delete_audio=True
+        delete_audio=True,
+        scenario=None
     ):
 
         super().__init__()
@@ -505,6 +573,7 @@ class AITutorWorker(QThread):
         self.whisper_model = whisper_model
         self.llm = llm
         self.delete_audio = delete_audio
+        self.scenario = scenario
 
     def run(self):
 
@@ -697,40 +766,61 @@ class AITutorWorker(QThread):
             "English"
         )
 
+        parts = [
+            f"You are a friendly, patient {language_name} tutor "
+            f"helping a beginner (CEFR level {LEARNER_LEVEL}) practise "
+            f"spoken {language_name}. Use only very simple, common "
+            f"words, short sentences (about 5 to 8 words) and mostly "
+            f"the present tense. Avoid idioms and slang. The "
+            f"student's speech was transcribed automatically, so the "
+            f"transcript may contain recognition errors. If a "
+            f"sentence looks garbled, say it was unclear instead of "
+            f"guessing."
+        ]
+
         if self.mode == "Review Mode":
 
-            mode_instruction = (
+            parts.append(
                 "Do not continue the conversation. Briefly summarise "
                 "what the student said."
             )
 
         else:
 
-            mode_instruction = (
-                "Be a natural conversation partner on whatever topic "
-                "or situation the student chooses. Follow their lead, "
-                "keep the conversation moving, and end with one "
-                "simple question."
-            )
+            if self.scenario:
 
-        return (
-            f"You are a friendly, patient {language_name} tutor "
-            f"helping a student practise spoken {language_name}. "
-            f"The student's speech was transcribed automatically, so "
-            f"the transcript may contain recognition errors. If a "
-            f"sentence looks garbled, say it was unclear instead of "
-            f"guessing.\n\n"
-            f"{mode_instruction}\n\n"
-            f"Rules:\n"
-            f"- Respond to the student's LATEST message. Earlier "
-            f"messages are background only.\n"
-            f"- If the student has finished something (for example "
-            f"said thank you), move on to a new topic. Never repeat "
-            f"an earlier topic.\n"
+                title, role = self.scenario
+
+                parts.append(
+                    f"Role-play scenario: \"{title}\". You play "
+                    f"{role}. Stay in this role, keep the situation "
+                    f"realistic, and move it forward one small step "
+                    f"at a time. Ask only one simple question at a "
+                    f"time."
+                )
+
+            else:
+
+                parts.append(
+                    "Be a natural conversation partner on whatever "
+                    "topic the student chooses. Follow their lead, "
+                    "keep the conversation moving, and end with one "
+                    "simple question."
+                )
+
+        parts.append(
+            "Rules:\n"
+            "- Respond to the student's LATEST message. Earlier "
+            "messages are background only.\n"
+            "- If the student has finished something (for example "
+            "said thank you), move on. Never repeat an earlier "
+            "topic.\n"
             f"- Write ONLY your reply, in {language_name}, in 1-3 "
-            f"short sentences. Do not translate, correct or comment "
-            f"on the student's grammar."
+            "short sentences. Do not translate, correct or comment "
+            "on the student's grammar."
         )
+
+        return "\n\n".join(parts)
 
     def generate_reply(self, user_text):
 
@@ -1140,18 +1230,24 @@ class TutorApp(QMainWindow):
         layout = QVBoxLayout(central_widget)
 
         layout.setContentsMargins(
-            20, 20, 20, 20
+            12, 10, 12, 12
         )
 
-        layout.setSpacing(15)
+        layout.setSpacing(8)
 
-        # MODE SELECTOR
+        # SETTINGS (compact grid: Mode | Language on one row)
 
-        mode_layout = QHBoxLayout()
+        field_style = "padding: 3px; font-size: 13px;"
 
-        mode_layout.addWidget(
-            QLabel("<b>Mode:</b>")
-        )
+        grid = QGridLayout()
+
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+
+        # Row 0: Mode and Language
 
         self.mode_dropdown = QComboBox()
 
@@ -1160,24 +1256,7 @@ class TutorApp(QMainWindow):
             "Review Mode"
         ])
 
-        self.mode_dropdown.setStyleSheet(
-            "padding: 5px; font-size: 14px;"
-        )
-
-        mode_layout.addWidget(
-            self.mode_dropdown,
-            stretch=1
-        )
-
-        layout.addLayout(mode_layout)
-
-        # LANGUAGE SELECTOR
-
-        language_layout = QHBoxLayout()
-
-        language_layout.addWidget(
-            QLabel("<b>Language:</b>")
-        )
+        self.mode_dropdown.setStyleSheet(field_style)
 
         self.language_dropdown = QComboBox()
 
@@ -1189,16 +1268,63 @@ class TutorApp(QMainWindow):
             "Russian"
         )
 
-        self.language_dropdown.setStyleSheet(
-            "padding: 5px; font-size: 14px;"
+        self.language_dropdown.setStyleSheet(field_style)
+
+        grid.addWidget(QLabel("<b>Mode</b>"), 0, 0)
+        grid.addWidget(self.mode_dropdown, 0, 1)
+        grid.addWidget(QLabel("<b>Language</b>"), 0, 2)
+        grid.addWidget(self.language_dropdown, 0, 3)
+
+        # Row 1: Scenario (full width)
+
+        self.scenario_dropdown = QComboBox()
+
+        self.scenario_dropdown.addItem(FREE_CONVERSATION)
+        self.scenario_dropdown.addItem(CUSTOM_SCENARIO)
+
+        self.scenario_dropdown.addItems(
+            [title for title, _ in SCENARIOS]
         )
 
-        language_layout.addWidget(
-            self.language_dropdown,
-            stretch=1
+        self.scenario_dropdown.setMaxVisibleItems(15)
+
+        self.scenario_dropdown.setStyleSheet(field_style)
+
+        grid.addWidget(QLabel("<b>Scenario</b>"), 1, 0)
+        grid.addWidget(self.scenario_dropdown, 1, 1, 1, 3)
+
+        # Row 2: Custom situation (only shown for "Custom situation...")
+
+        self.applied_custom_text = ""
+
+        self.custom_scenario_label = QLabel("<b>Situation</b>")
+
+        self.custom_scenario_input = QLineEdit()
+
+        self.custom_scenario_input.setMaxLength(200)
+
+        self.custom_scenario_input.setPlaceholderText(
+            "Describe your situation, e.g. buying a gift for "
+            "my mother's birthday"
         )
 
-        layout.addLayout(language_layout)
+        self.custom_scenario_input.setStyleSheet(field_style)
+
+        grid.addWidget(self.custom_scenario_label, 2, 0)
+        grid.addWidget(self.custom_scenario_input, 2, 1, 1, 3)
+
+        layout.addLayout(grid)
+
+        # Hidden until "Custom situation..." is selected
+        self.set_custom_row_visible(False)
+
+        self.scenario_dropdown.currentIndexChanged.connect(
+            self.on_scenario_changed
+        )
+
+        self.custom_scenario_input.editingFinished.connect(
+            self.on_custom_scenario_edited
+        )
 
         # CHAT DISPLAY
 
@@ -1457,6 +1583,112 @@ class TutorApp(QMainWindow):
             )
 
     # -----------------------------------------------------
+    # SCENARIO
+    # -----------------------------------------------------
+
+    def get_selected_scenario(self):
+
+        index = self.scenario_dropdown.currentIndex()
+
+        if index <= 0:
+            return None
+
+        if index == 1:
+
+            text = self.custom_scenario_input.text().strip()[:200]
+
+            if not text:
+                return None
+
+            return (
+                text,
+                "the person the student would naturally talk to "
+                "in this situation"
+            )
+
+        return SCENARIOS[index - 2]
+
+    def set_custom_row_visible(self, visible):
+
+        self.custom_scenario_label.setVisible(visible)
+        self.custom_scenario_input.setVisible(visible)
+
+    def on_scenario_changed(self, index):
+
+        is_custom = index == 1
+
+        self.set_custom_row_visible(is_custom)
+
+        if is_custom:
+            self.custom_scenario_input.setFocus()
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.chat_history.clear()
+
+        self.applied_custom_text = (
+            self.custom_scenario_input.text().strip()
+            if is_custom else ""
+        )
+
+        scenario = self.get_selected_scenario()
+
+        if is_custom and scenario is None:
+
+            self.add_system_message(
+                "Type your own situation in the Situation box, "
+                "then start speaking."
+            )
+
+            return
+
+        if scenario is None:
+
+            self.add_system_message(
+                "Free conversation. Talk about anything you like."
+            )
+
+            return
+
+        title, role = scenario
+
+        if is_custom:
+
+            self.add_system_message(
+                f"Custom scenario: {title}. Start by saying hello!"
+            )
+
+            return
+
+        self.add_system_message(
+            f"Scenario: {title}. The tutor plays {role}. "
+            "Start by saying hello! "
+            "(Scenarios apply in Conversational Mode.)"
+        )
+
+    def on_custom_scenario_edited(self):
+
+        if self.scenario_dropdown.currentIndex() != 1:
+            return
+
+        text = self.custom_scenario_input.text().strip()
+
+        if not text or text == self.applied_custom_text:
+            return
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.applied_custom_text = text
+
+        self.chat_history.clear()
+
+        self.add_system_message(
+            f"Custom scenario: {text}. Start by saying hello!"
+        )
+
+    # -----------------------------------------------------
     # NEW TOPIC (clear the tutor's memory)
     # -----------------------------------------------------
 
@@ -1559,7 +1791,8 @@ class TutorApp(QMainWindow):
             selected_language,
             self.whisper_model,
             self.llm,
-            delete_audio=delete_audio
+            delete_audio=delete_audio,
+            scenario=self.get_selected_scenario()
         )
 
         self.worker.finished.connect(
