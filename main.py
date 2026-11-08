@@ -1,3 +1,6 @@
+import faulthandler
+faulthandler.enable()
+
 import sys
 import multiprocessing
 import traceback
@@ -5,6 +8,7 @@ import os
 import tempfile
 import html
 import random
+import json
 
 import sounddevice as sd
 import soundfile as sf
@@ -13,7 +17,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QTextBrowser,
-    QProgressBar, QComboBox, QLabel
+    QProgressBar, QComboBox, QLabel, QFileDialog
 )
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -26,8 +30,51 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 USE_REAL_WHISPER = True
 
 if USE_REAL_WHISPER:
-    import whisperx
+    # onnxruntime must load BEFORE torch on Windows. Torch ships an
+    # older Visual C++ runtime, and onnxruntime crashes with an access
+    # violation if that runtime is already loaded. whisperx -> pyannote
+    # imports onnxruntime lazily, so load it explicitly up front.
+    print("[BOOT] importing onnxruntime...", flush=True)
+    try:
+        import onnxruntime
+    except ImportError:
+        pass
+
+    print("[BOOT] importing torch...", flush=True)
     import torch
+    print("[BOOT] importing whisperx...", flush=True)
+    import whisperx
+    import whisperx.asr  # triggers pyannote/onnxruntime imports now
+    print("[BOOT] imports done", flush=True)
+
+
+# =========================================================
+# LOCAL LLM SETTINGS (llama.cpp / GGUF)
+# =========================================================
+
+USE_LOCAL_LLM = True
+
+# Path to any chat-tuned GGUF model. Override with the
+# TUTOR_LLM_PATH environment variable if you like.
+# Recommended multilingual models: Qwen2.5-3B/7B-Instruct,
+# Llama-3.1-8B-Instruct, Gemma-2-9B-it (Q4_K_M quantisation).
+LLM_MODEL_PATH = os.environ.get(
+    "TUTOR_LLM_PATH",
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "models",
+        "qwen2.5-3b-instruct-q4_k_m.gguf"
+    )
+)
+
+LLM_CONTEXT_SIZE = 4096
+LLM_MAX_NEW_TOKENS = 500
+LLM_TEMPERATURE = 0.4
+
+# How many previous chat messages are sent to the model
+LLM_MAX_HISTORY = 6
+
+# llama_cpp is imported lazily in TutorApp.load_llm_model()
 
 
 # =========================================================
@@ -55,6 +102,10 @@ LANGUAGES = {
     "Swedish": "sv",
     "Norwegian": "no",
     "Danish": "da"
+}
+
+LANGUAGE_NAMES = {
+    code: name for name, code in LANGUAGES.items()
 }
 
 
@@ -224,6 +275,7 @@ class AudioRecorder:
         )
 
         self.last_recorded_data = None
+        self.last_rate = samplerate
 
     @staticmethod
     def get_input_devices():
@@ -248,6 +300,51 @@ class AudioRecorder:
 
         return input_devices
 
+    def resolve_input_device(self, device_index=None):
+        """Pick a usable input device even if Windows has no default."""
+
+        if device_index is not None:
+            return device_index
+
+        # 1. The system default, if it is valid
+        try:
+
+            default_device = sd.default.device[0]
+
+            if default_device is not None and default_device >= 0:
+
+                sd.query_devices(default_device, "input")
+                return default_device
+
+        except Exception:
+            pass
+
+        # 2. Otherwise the first real input device
+        #    (skip the "Sound Mapper", which depends on the default)
+        devices = self.get_input_devices()
+
+        print("[MIC] No default input device. Available inputs:")
+
+        for dev in devices:
+            print(f"[MIC]   {dev['index']}: {dev['name']}")
+
+        preferred = [
+            d for d in devices
+            if "mapper" not in d["name"].lower()
+        ]
+
+        if preferred:
+            return preferred[0]["index"]
+
+        if devices:
+            return devices[0]["index"]
+
+        raise RuntimeError(
+            "No microphone found. Connect a microphone and make sure "
+            "Windows allows desktop apps to use it "
+            "(Settings > Privacy > Microphone)."
+        )
+
     def start_recording(self, device_index=None):
 
         self.recording = []
@@ -256,16 +353,50 @@ class AudioRecorder:
 
         try:
 
-            self.stream = sd.InputStream(
-                samplerate=self.samplerate,
-                channels=1,
-                device=device_index,
-                callback=self.audio_callback
-            )
+            device = self.resolve_input_device(device_index)
 
-            self.stream.start()
+            device_info = sd.query_devices(device, "input")
 
-            print("[MIC] Recording started.")
+            print(f"[MIC] Using device {device}: {device_info['name']}")
+
+            # Try 16 kHz first, then the device's native rate
+            rates = [self.samplerate]
+
+            native_rate = int(device_info["default_samplerate"])
+
+            if native_rate not in rates:
+                rates.append(native_rate)
+
+            last_error = None
+
+            for rate in rates:
+
+                try:
+
+                    self.stream = sd.InputStream(
+                        samplerate=rate,
+                        channels=1,
+                        device=device,
+                        callback=self.audio_callback
+                    )
+
+                    self.stream.start()
+
+                    self.samplerate = rate
+
+                    last_error = None
+
+                    break
+
+                except Exception as e:
+
+                    self.stream = None
+                    last_error = e
+
+            if last_error is not None:
+                raise last_error
+
+            print(f"[MIC] Recording started at {self.samplerate} Hz.")
 
         except Exception as e:
 
@@ -310,6 +441,8 @@ class AudioRecorder:
             axis=0
         )
 
+        self.last_rate = self.samplerate
+
         if np.max(np.abs(self.last_recorded_data)) == 0:
 
             print("[MIC WARNING] Recording is silent.")
@@ -328,7 +461,7 @@ class AudioRecorder:
 
             sd.play(
                 self.last_recorded_data,
-                self.samplerate
+                self.last_rate
             )
 
             sd.wait()
@@ -344,7 +477,7 @@ class AudioRecorder:
 
 class AITutorWorker(QThread):
 
-    finished = pyqtSignal(str, int, str, str, str, str)
+    finished = pyqtSignal(str, int, str, str, str)
     error = pyqtSignal(str)
 
     def __init__(
@@ -353,7 +486,9 @@ class AITutorWorker(QThread):
         chat_history,
         mode,
         language,
-        whisper_model
+        whisper_model,
+        llm=None,
+        delete_audio=True
     ):
 
         super().__init__()
@@ -363,6 +498,8 @@ class AITutorWorker(QThread):
         self.mode = mode
         self.language = language
         self.whisper_model = whisper_model
+        self.llm = llm
+        self.delete_audio = delete_audio
 
     def run(self):
 
@@ -374,7 +511,7 @@ class AITutorWorker(QThread):
 
             if USE_REAL_WHISPER:
 
-                audio = whisperx.load_audio(
+                audio = self.load_audio_16k(
                     self.audio_path
                 )
 
@@ -406,42 +543,58 @@ class AITutorWorker(QThread):
                 )
 
             # ---------------------------------------------
-            # STEP 2: LANGUAGE-MATCHED TUTOR RESPONSE
+            # STEP 2 + 3: TUTOR RESPONSE, TRANSLATION,
+            #             AND GRAMMAR FEEDBACK
             # ---------------------------------------------
 
-            if self.mode == "Review Mode":
+            llm_result = None
 
-                ai_response = self.get_review_response(
-                    transcribed_text
-                )
+            if self.llm is not None:
+
+                try:
+
+                    llm_result = self.generate_llm_feedback(
+                        transcribed_text
+                    )
+
+                except Exception as e:
+
+                    print(f"[LLM ERROR] {e}")
+                    traceback.print_exc()
+
+            if llm_result:
+
+                ai_response = llm_result["response"]
+                ai_translation = llm_result["translation"]
+                ai_correction = llm_result["correction"]
 
             else:
 
-                ai_response = random.choice(
-                    TUTOR_RESPONSES.get(
-                        self.language,
-                        TUTOR_RESPONSES["en"]
+                # Fallback when the LLM is missing or failed.
+                # Canned replies are NOT genuine assessments.
+
+                if self.mode == "Review Mode":
+
+                    ai_response = self.get_review_response(
+                        transcribed_text
                     )
+
+                else:
+
+                    ai_response = random.choice(
+                        TUTOR_RESPONSES.get(
+                            self.language,
+                            TUTOR_RESPONSES["en"]
+                        )
+                    )
+
+                ai_translation = (
+                    "[Translation unavailable: local LLM not running]"
                 )
 
-            # ---------------------------------------------
-            # STEP 3: TRANSLATION AND FEEDBACK
-            # ---------------------------------------------
-
-            # These are placeholders until an LLM is connected.
-            # Do not present these as genuine grammar assessments.
-
-            ai_translation = (
-                "[English translation requires an LLM]"
-            )
-
-            ai_correction = (
-                "[Grammar feedback requires an LLM]"
-            )
-
-            ai_pronunciation = (
-                "[Pronunciation assessment requires an LLM]"
-            )
+                ai_correction = (
+                    "[Grammar feedback unavailable: local LLM not running]"
+                )
 
             # ---------------------------------------------
             # STEP 4: RETURN RESULTS TO GUI
@@ -452,8 +605,7 @@ class AITutorWorker(QThread):
                 clarity_score,
                 ai_response,
                 ai_translation,
-                ai_correction,
-                ai_pronunciation
+                ai_correction
             )
 
         except Exception as e:
@@ -462,13 +614,177 @@ class AITutorWorker(QThread):
 
         finally:
 
-            if os.path.exists(self.audio_path):
+            # Only delete temporary recordings, never a file the
+            # user chose to open.
+            if self.delete_audio and os.path.exists(self.audio_path):
 
                 try:
                     os.remove(self.audio_path)
 
                 except Exception:
                     pass
+
+    @staticmethod
+    def load_audio_16k(path):
+        """Load a wav as 16 kHz mono float32 without needing ffmpeg."""
+
+        data, rate = sf.read(path, dtype="float32")
+
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+
+        if rate != 16000:
+
+            import torchaudio.functional as taf
+
+            data = taf.resample(
+                torch.from_numpy(data),
+                rate,
+                16000
+            ).numpy()
+
+        return np.ascontiguousarray(data, dtype=np.float32)
+
+    # -----------------------------------------------------
+    # LOCAL LLM
+    # -----------------------------------------------------
+
+    LLM_KEYS = (
+        "response",
+        "translation",
+        "correction"
+    )
+
+    def build_system_prompt(self):
+
+        language_name = LANGUAGE_NAMES.get(
+            self.language,
+            "English"
+        )
+
+        if self.mode == "Review Mode":
+
+            mode_instruction = (
+                "Do not continue the conversation. In \"response\", "
+                "briefly summarise what the student said and how "
+                "well they expressed it."
+            )
+
+        else:
+
+            mode_instruction = (
+                "Act as a conversation partner in the situation the "
+                "student is practising (for example a waiter or shop "
+                "assistant if they are ordering). Move the situation "
+                "forward and end with one simple question."
+            )
+
+        return (
+            f"You are a friendly, patient {language_name} tutor "
+            f"helping a student practise spoken {language_name}. "
+            f"The student's speech was transcribed automatically, so "
+            f"the transcript may contain recognition errors. If a "
+            f"sentence looks garbled, say it was unclear instead of "
+            f"guessing.\n\n"
+            f"{mode_instruction}\n\n"
+            f"Rules:\n"
+            f"- Respond to the student's LATEST message. Earlier "
+            f"messages are background only.\n"
+            f"- If the student has finished something (for example "
+            f"said thank you), move on to a new topic. Never keep "
+            f"repeating an earlier topic or an earlier correction.\n"
+            f"- Judge only the latest message, never earlier ones.\n\n"
+            f"Reply with a single JSON object with exactly these "
+            f"keys:\n"
+            f"- \"response\": your reply to the student, written in "
+            f"{language_name}, 1-3 short sentences.\n"
+            f"- \"translation\": a faithful English translation of "
+            f"\"response\" only (empty string if {language_name} is "
+            f"English).\n"
+            f"- \"correction\": 1-2 sentences in English about the "
+            f"student's latest message. Quote the specific wrong "
+            f"words and give the corrected sentence. If there are no "
+            f"mistakes, write \"No mistakes.\" Never just repeat the "
+            f"student's sentence back.\n"
+            f"Output JSON only, with no extra text."
+        )
+
+    def generate_llm_feedback(self, user_text):
+
+        messages = [
+            {
+                "role": "system",
+                "content": self.build_system_prompt()
+            }
+        ]
+
+        for msg in self.chat_history[-LLM_MAX_HISTORY:]:
+
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+
+        messages.append({
+            "role": "user",
+            "content": user_text[:2000]
+        })
+
+        output = self.llm.create_chat_completion(
+            messages=messages,
+            temperature=LLM_TEMPERATURE,
+            max_tokens=LLM_MAX_NEW_TOKENS,
+            response_format={
+                "type": "json_object",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        key: {"type": "string"}
+                        for key in self.LLM_KEYS
+                    },
+                    "required": list(self.LLM_KEYS)
+                }
+            }
+        )
+
+        raw_text = output["choices"][0]["message"]["content"]
+
+        return self.parse_llm_json(raw_text)
+
+    def parse_llm_json(self, raw_text):
+
+        data = None
+
+        try:
+            data = json.loads(raw_text)
+
+        except json.JSONDecodeError:
+
+            start = raw_text.find("{")
+            end = raw_text.rfind("}")
+
+            if start != -1 and end > start:
+
+                try:
+                    data = json.loads(raw_text[start:end + 1])
+
+                except json.JSONDecodeError:
+                    data = None
+
+        if not isinstance(data, dict):
+
+            print(f"[LLM] Could not parse output: {raw_text!r}")
+            return None
+
+        result = {
+            key: str(data.get(key, "")).strip()
+            for key in self.LLM_KEYS
+        }
+
+        if not result["response"]:
+            return None
+
+        return result
 
     def get_review_response(self, text):
 
@@ -545,6 +861,8 @@ class TutorApp(QMainWindow):
 
         self.whisper_model = None
 
+        self.llm = None
+
         self.setup_ui()
 
         self.add_system_message(
@@ -556,6 +874,75 @@ class TutorApp(QMainWindow):
         # Load WhisperX once
         if USE_REAL_WHISPER:
             self.load_whisper_model()
+
+        # Load local LLM once
+        if USE_LOCAL_LLM:
+            self.load_llm_model()
+
+    # -----------------------------------------------------
+    # LOAD LOCAL LLM
+    # -----------------------------------------------------
+
+    def load_llm_model(self):
+
+        try:
+
+            print("[BOOT] importing llama_cpp...", flush=True)
+
+            from llama_cpp import Llama
+
+            print("[BOOT] llama_cpp imported", flush=True)
+
+        except Exception as e:
+
+            self.add_system_message(
+                f"llama-cpp-python could not be loaded: {e}. "
+                "Tutor feedback will use placeholder text."
+            )
+
+            return
+
+        if not os.path.isfile(LLM_MODEL_PATH):
+
+            self.add_system_message(
+                f"LLM model file not found: {LLM_MODEL_PATH}. "
+                "Set TUTOR_LLM_PATH or place a GGUF model there. "
+                "Tutor feedback will use placeholder text."
+            )
+
+            return
+
+        try:
+
+            self.add_system_message(
+                "Loading language model..."
+            )
+
+            QApplication.processEvents()
+
+            use_gpu = (
+                USE_REAL_WHISPER and torch.cuda.is_available()
+            )
+
+            self.llm = Llama(
+                model_path=LLM_MODEL_PATH,
+                n_ctx=LLM_CONTEXT_SIZE,
+                n_gpu_layers=-1 if use_gpu else 0,
+                verbose=False
+            )
+
+            self.add_system_message(
+                "Language model loaded successfully."
+            )
+
+        except Exception as e:
+
+            self.llm = None
+
+            self.add_system_message(
+                f"LLM loading error: {e}. "
+                "Tutor feedback will use placeholder text."
+            )
 
     # -----------------------------------------------------
     # LOAD WHISPER MODEL
@@ -596,7 +983,7 @@ class TutorApp(QMainWindow):
         except Exception as e:
 
             self.add_system_message(
-                f"WhisperX loading error: {html.escape(str(e))}"
+                f"WhisperX loading error: {e}"
             )
 
             self.btn_record.setEnabled(False)
@@ -791,6 +1178,74 @@ class TutorApp(QMainWindow):
             stretch=1
         )
 
+        self.btn_open = QPushButton(
+            "Open Audio File"
+        )
+
+        self.btn_open.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+
+        self.btn_open.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+                color: white;
+                font-weight: bold;
+                padding: 18px;
+                font-size: 14px;
+                border-radius: 25px;
+            }
+
+            QPushButton:hover {
+                background-color: #2ecc71;
+            }
+
+            QPushButton:disabled {
+                background-color: #a9dfbf;
+            }
+        """)
+
+        self.btn_open.clicked.connect(
+            self.open_audio_file
+        )
+
+        controls_layout.addWidget(
+            self.btn_open,
+            stretch=2
+        )
+
+        self.btn_new = QPushButton(
+            "New Topic"
+        )
+
+        self.btn_new.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+
+        self.btn_new.setStyleSheet("""
+            QPushButton {
+                background-color: #8e44ad;
+                color: white;
+                font-weight: bold;
+                padding: 18px;
+                font-size: 14px;
+                border-radius: 25px;
+            }
+
+            QPushButton:hover {
+                background-color: #9b59b6;
+            }
+        """)
+
+        self.btn_new.clicked.connect(
+            self.new_topic
+        )
+
+        controls_layout.addWidget(
+            self.btn_new,
+            stretch=1
+        )
+
         layout.addLayout(
             controls_layout
         )
@@ -828,7 +1283,7 @@ class TutorApp(QMainWindow):
             )
 
             self.add_system_message(
-                f"Microphone error: {html.escape(str(e))}"
+                f"Microphone error: {e}"
             )
 
     # -----------------------------------------------------
@@ -863,10 +1318,76 @@ class TutorApp(QMainWindow):
             )
 
     # -----------------------------------------------------
+    # NEW TOPIC (clear the tutor's memory)
+    # -----------------------------------------------------
+
+    def new_topic(self):
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.chat_history.clear()
+
+        self.add_system_message(
+            "New topic started. The tutor has forgotten "
+            "the previous messages."
+        )
+
+    # -----------------------------------------------------
+    # OPEN AUDIO FILE
+    # -----------------------------------------------------
+
+    def open_audio_file(self):
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Audio File",
+            "",
+            "Audio Files (*.wav *.flac *.ogg *.mp3);;All Files (*)"
+        )
+
+        if not path:
+            return
+
+        # Read it once to validate the format and enable playback
+        try:
+
+            data, rate = sf.read(
+                path,
+                dtype="float32"
+            )
+
+        except Exception as e:
+
+            self.add_system_message(
+                f"Could not read audio file: {e}. "
+                "Supported formats: WAV, FLAC, OGG, MP3."
+            )
+
+            return
+
+        self.recorder.last_recorded_data = data
+        self.recorder.last_rate = rate
+
+        self.btn_play.setEnabled(True)
+
+        self.add_system_message(
+            f"Processing file: {os.path.basename(path)}"
+        )
+
+        self.process_audio(
+            path,
+            delete_audio=False
+        )
+
+    # -----------------------------------------------------
     # PROCESS AUDIO
     # -----------------------------------------------------
 
-    def process_audio(self, audio_path):
+    def process_audio(self, audio_path, delete_audio=True):
 
         if USE_REAL_WHISPER and self.whisper_model is None:
 
@@ -875,10 +1396,12 @@ class TutorApp(QMainWindow):
             )
 
             self.btn_record.setEnabled(True)
+            self.btn_open.setEnabled(True)
 
             return
 
         self.btn_record.setEnabled(False)
+        self.btn_open.setEnabled(False)
 
         self.progress_bar.setVisible(True)
 
@@ -895,7 +1418,9 @@ class TutorApp(QMainWindow):
             self.chat_history.copy(),
             current_mode,
             selected_language,
-            self.whisper_model
+            self.whisper_model,
+            self.llm,
+            delete_audio=delete_audio
         )
 
         self.worker.finished.connect(
@@ -989,14 +1514,12 @@ class TutorApp(QMainWindow):
         self,
         response,
         translation,
-        correction,
-        pronunciation
+        correction
     ):
 
         response = html.escape(response)
         translation = html.escape(translation)
         correction = html.escape(correction)
-        pronunciation = html.escape(pronunciation)
 
         message = f"""
         <div style='margin-bottom: 20px;
@@ -1042,11 +1565,6 @@ class TutorApp(QMainWindow):
                     <b>Feedback:</b>
                     {correction}
 
-                    <br><br>
-
-                    <b>Pronunciation:</b>
-                    <i>{pronunciation}</i>
-
                 </div>
 
             </div>
@@ -1068,11 +1586,11 @@ class TutorApp(QMainWindow):
         clarity_score,
         ai_response,
         ai_translation,
-        ai_correction,
-        ai_pronunciation
+        ai_correction
     ):
 
         self.btn_record.setEnabled(True)
+        self.btn_open.setEnabled(True)
 
         self.progress_bar.setVisible(False)
 
@@ -1094,8 +1612,7 @@ class TutorApp(QMainWindow):
         self.append_ai_message(
             ai_response,
             ai_translation,
-            ai_correction,
-            ai_pronunciation
+            ai_correction
         )
 
         self.chat_display.verticalScrollBar().setValue(
@@ -1109,6 +1626,7 @@ class TutorApp(QMainWindow):
     def on_processing_error(self, error_msg):
 
         self.btn_record.setEnabled(True)
+        self.btn_open.setEnabled(True)
 
         self.progress_bar.setVisible(False)
 
