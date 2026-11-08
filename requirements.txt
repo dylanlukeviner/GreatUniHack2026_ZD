@@ -1,4 +1,8 @@
-# Python 3.11 recommended
+# Python 3.11
+
+# Keep setuptools older: newer releases removed pkg_resources,
+# which whisperx / pyannote / ctranslate2 still import
+setuptools==75.8.0
 
 DateTime==5.5
 cdifflib==1.2.9
@@ -8,6 +12,17 @@ torch==2.5.1
 torchaudio==2.5.1
 
 demucs==4.0.1
-whisperx==3.2.0
+
+# Compatible WhisperX stack
+whisperx==3.3.4
+faster-whisper==1.1.1
+av==12.3.0
+ctranslate2==4.4.0
+pyannote-audio==3.3.2
+transformers==4.48.3
 
 soundfile==0.13.1
+sounddevice==0.5.1
+
+# Local LLM
+llama-cpp-python==0.3.2
