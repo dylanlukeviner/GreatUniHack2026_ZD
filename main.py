@@ -9,6 +9,7 @@ import tempfile
 import html
 import random
 import json
+import re
 
 import sounddevice as sd
 import soundfile as sf
@@ -66,6 +67,10 @@ LLM_MODEL_PATH = os.environ.get(
         "qwen2.5-3b-instruct-q4_k_m.gguf"
     )
 )
+
+# Speech recognition model size: "small" is fast; "medium" is
+# noticeably more accurate for Russian and other non-English languages.
+WHISPER_MODEL_SIZE = "small"
 
 LLM_CONTEXT_SIZE = 4096
 LLM_MAX_NEW_TOKENS = 500
@@ -649,11 +654,41 @@ class AITutorWorker(QThread):
     # LOCAL LLM
     # -----------------------------------------------------
 
-    LLM_KEYS = (
-        "response",
-        "translation",
-        "correction"
-    )
+    # The tutor is split into three small, separate LLM calls:
+    #   1. reply      - sees the conversation history
+    #   2. translation - sees ONLY the reply
+    #   3. feedback   - sees ONLY the student's latest sentence
+    # Small models cope far better with one simple task per call, and
+    # the feedback step can no longer copy the tutor's reply.
+
+    @staticmethod
+    def normalise(text):
+
+        return " ".join(
+            re.sub(r"[^\w\s]", "", text.lower()).split()
+        )
+
+    def chat(self, messages, max_tokens, temperature, schema=None):
+
+        kwargs = {}
+
+        if schema is not None:
+
+            kwargs["response_format"] = {
+                "type": "json_object",
+                "schema": schema
+            }
+
+        output = self.llm.create_chat_completion(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+
+        return output["choices"][0]["message"]["content"].strip()
+
+    # ---------- 1. TUTOR REPLY ----------
 
     def build_system_prompt(self):
 
@@ -665,18 +700,17 @@ class AITutorWorker(QThread):
         if self.mode == "Review Mode":
 
             mode_instruction = (
-                "Do not continue the conversation. In \"response\", "
-                "briefly summarise what the student said and how "
-                "well they expressed it."
+                "Do not continue the conversation. Briefly summarise "
+                "what the student said."
             )
 
         else:
 
             mode_instruction = (
-                "Act as a conversation partner in the situation the "
-                "student is practising (for example a waiter or shop "
-                "assistant if they are ordering). Move the situation "
-                "forward and end with one simple question."
+                "Be a natural conversation partner on whatever topic "
+                "or situation the student chooses. Follow their lead, "
+                "keep the conversation moving, and end with one "
+                "simple question."
             )
 
         return (
@@ -691,25 +725,14 @@ class AITutorWorker(QThread):
             f"- Respond to the student's LATEST message. Earlier "
             f"messages are background only.\n"
             f"- If the student has finished something (for example "
-            f"said thank you), move on to a new topic. Never keep "
-            f"repeating an earlier topic or an earlier correction.\n"
-            f"- Judge only the latest message, never earlier ones.\n\n"
-            f"Reply with a single JSON object with exactly these "
-            f"keys:\n"
-            f"- \"response\": your reply to the student, written in "
-            f"{language_name}, 1-3 short sentences.\n"
-            f"- \"translation\": a faithful English translation of "
-            f"\"response\" only (empty string if {language_name} is "
-            f"English).\n"
-            f"- \"correction\": 1-2 sentences in English about the "
-            f"student's latest message. Quote the specific wrong "
-            f"words and give the corrected sentence. If there are no "
-            f"mistakes, write \"No mistakes.\" Never just repeat the "
-            f"student's sentence back.\n"
-            f"Output JSON only, with no extra text."
+            f"said thank you), move on to a new topic. Never repeat "
+            f"an earlier topic.\n"
+            f"- Write ONLY your reply, in {language_name}, in 1-3 "
+            f"short sentences. Do not translate, correct or comment "
+            f"on the student's grammar."
         )
 
-    def generate_llm_feedback(self, user_text):
+    def generate_reply(self, user_text):
 
         messages = [
             {
@@ -727,33 +750,159 @@ class AITutorWorker(QThread):
 
         messages.append({
             "role": "user",
-            "content": user_text[:2000]
+            "content": user_text
         })
 
-        output = self.llm.create_chat_completion(
-            messages=messages,
-            temperature=LLM_TEMPERATURE,
-            max_tokens=LLM_MAX_NEW_TOKENS,
-            response_format={
-                "type": "json_object",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        key: {"type": "string"}
-                        for key in self.LLM_KEYS
-                    },
-                    "required": list(self.LLM_KEYS)
-                }
-            }
+        reply = self.chat(
+            messages,
+            LLM_MAX_NEW_TOKENS,
+            LLM_TEMPERATURE
         )
 
-        raw_text = output["choices"][0]["message"]["content"]
+        return reply.strip().strip('"\u201c\u201d\u00ab\u00bb`').strip()
 
-        return self.parse_llm_json(raw_text)
+    # ---------- 2. TRANSLATION ----------
 
-    def parse_llm_json(self, raw_text):
+    def translate_to_english(self, text):
 
-        data = None
+        language_name = LANGUAGE_NAMES.get(
+            self.language,
+            "English"
+        )
+
+        return self.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        f"Translate the following {language_name} "
+                        f"text into English. Output only the "
+                        f"translation, nothing else."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ],
+            300,
+            0.0
+        )
+
+    # ---------- 3. STUDENT FEEDBACK ----------
+
+    def check_student_sentence(self, user_text):
+
+        language_name = LANGUAGE_NAMES.get(
+            self.language,
+            "English"
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "has_mistakes": {"type": "boolean"},
+                "corrected": {"type": "string"},
+                "explanation": {"type": "string"}
+            },
+            "required": [
+                "has_mistakes",
+                "corrected",
+                "explanation"
+            ]
+        }
+
+        system = (
+            f"You are a strict {language_name} teacher checking ONE "
+            f"sentence spoken by a learner. It comes from automatic "
+            f"speech recognition, so ignore punctuation, "
+            f"capitalisation and spacing.\n"
+            f"Decide whether it contains a real grammar, word-form "
+            f"or word-choice mistake. Do not rewrite for style and "
+            f"do not comment on the meaning.\n"
+            f"Reply with a JSON object:\n"
+            f"- \"has_mistakes\": true only if there is a real "
+            f"mistake.\n"
+            f"- \"corrected\": the corrected sentence in "
+            f"{language_name}. If there are no mistakes, copy the "
+            f"sentence exactly.\n"
+            f"- \"explanation\": one short sentence in English "
+            f"naming the mistake. Empty if there are none."
+        )
+
+        raw = self.chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text}
+            ],
+            250,
+            0.0,
+            schema=schema
+        )
+
+        data = self.parse_json(raw)
+
+        if not data:
+            return "[Feedback unavailable]"
+
+        corrected = str(data.get("corrected", "")).strip()
+        explanation = str(data.get("explanation", "")).strip()
+
+        no_change = (
+            self.normalise(corrected) == self.normalise(user_text)
+        )
+
+        if (
+            not data.get("has_mistakes")
+            or no_change
+            or not corrected
+        ):
+            return "No mistakes found."
+
+        if explanation:
+            return f"Try: \"{corrected}\" \u2014 {explanation}"
+
+        return f"Try: \"{corrected}\""
+
+    # ---------- COMBINED ----------
+
+    def generate_llm_feedback(self, user_text):
+
+        user_text = user_text[:2000]
+
+        reply = self.generate_reply(user_text)
+
+        if not reply:
+            return None
+
+        translation = ""
+
+        if self.language != "en":
+
+            try:
+                translation = self.translate_to_english(reply)
+
+            except Exception as e:
+
+                print(f"[LLM] Translation failed: {e}")
+                translation = "[Translation unavailable]"
+
+        try:
+            correction = self.check_student_sentence(user_text)
+
+        except Exception as e:
+
+            print(f"[LLM] Feedback failed: {e}")
+            correction = "[Feedback unavailable]"
+
+        return {
+            "response": reply,
+            "translation": translation,
+            "correction": correction
+        }
+
+    @staticmethod
+    def parse_json(raw_text):
 
         try:
             data = json.loads(raw_text)
@@ -763,28 +912,18 @@ class AITutorWorker(QThread):
             start = raw_text.find("{")
             end = raw_text.rfind("}")
 
-            if start != -1 and end > start:
+            if start == -1 or end <= start:
+                print(f"[LLM] Could not parse: {raw_text!r}")
+                return None
 
-                try:
-                    data = json.loads(raw_text[start:end + 1])
+            try:
+                data = json.loads(raw_text[start:end + 1])
 
-                except json.JSONDecodeError:
-                    data = None
+            except json.JSONDecodeError:
+                print(f"[LLM] Could not parse: {raw_text!r}")
+                return None
 
-        if not isinstance(data, dict):
-
-            print(f"[LLM] Could not parse output: {raw_text!r}")
-            return None
-
-        result = {
-            key: str(data.get(key, "")).strip()
-            for key in self.LLM_KEYS
-        }
-
-        if not result["response"]:
-            return None
-
-        return result
+        return data if isinstance(data, dict) else None
 
     def get_review_response(self, text):
 
@@ -971,7 +1110,7 @@ class TutorApp(QMainWindow):
             )
 
             self.whisper_model = whisperx.load_model(
-                "small",
+                WHISPER_MODEL_SIZE,
                 device,
                 compute_type=compute_type
             )
